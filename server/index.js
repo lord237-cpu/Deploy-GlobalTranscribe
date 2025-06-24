@@ -1,8 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
-const youtubedl = require('youtube-dl-exec');
+const ytdl = require('yt-dlp-wrap');
 const { transcribeAudio, synthesizeSpeech, synthesizeSynchronizedSpeech } = require('./services/translationService');
+const ffmpegPath = require('ffmpeg-static');
+const ffmpeg = require('fluent-ffmpeg');
+
+// Configurer le chemin vers ffmpeg
+ffmpeg.setFfmpegPath(ffmpegPath);
 const path = require('path');
 const fs = require('fs');
 
@@ -46,25 +51,39 @@ const AWS_ACCESS_KEY = process.env.AWS_ACCESS_KEY;
 const AWS_SECRET_KEY = process.env.AWS_SECRET_KEY;
 const AWS_REGION = process.env.AWS_REGION;
 
-// Créer le dossier downloads s'il n'existe pas
-const downloadsDir = path.join(process.cwd(), 'downloads');
-if (!fs.existsSync(downloadsDir)) {
-    fs.mkdirSync(downloadsDir);
+// Configuration des répertoires
+const isProduction = process.env.NODE_ENV === 'production';
+const tempDir = isProduction 
+  ? path.join(os.tmpdir(), 'globaltranscribe')
+  : path.join(__dirname, '..', 'downloads');
+
+// Créer le dossier temporaire s'il n'existe pas
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
 }
 
-// Servir les fichiers statiques du dossier downloads avec configuration avancée
+console.log(`[CONFIG] Répertoire de travail: ${tempDir}`);
+
+// Servir les fichiers statiques du dossier temporaire avec configuration avancée
 app.use('/downloads', (req, res, next) => {
-  // Ajouter des en-têtes pour permettre la lecture en streaming
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Cache-Control', 'public, max-age=3600');
-  next();
-}, express.static(downloadsDir, {
-  setHeaders: (res, path) => {
-    if (path.endsWith('.mp3') || path.endsWith('.mp4') || path.endsWith('.webm')) {
-      res.setHeader('Content-Type', path.endsWith('.mp3') ? 'audio/mpeg' : 'video/mp4');
-    }
-  }
-}));
+    // Ajouter des en-têtes de contrôle de cache
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+    
+    express.static(tempDir, {
+        etag: false, // Désactiver le cache côté client
+        lastModified: false,
+        setHeaders: (res, path) => {
+            // Ajouter des en-têtes spécifiques pour les fichiers audio
+            if (path.endsWith('.mp3') || path.endsWith('.wav')) {
+                res.setHeader('Content-Type', 'audio/mpeg');
+                res.setHeader('Accept-Ranges', 'bytes');
+            }
+        }
+    })(req, res, next);
+});
 
 // Route pour obtenir les détails d'une vidéo YouTube
 app.get('/api/video-info', async (req, res) => {
@@ -192,69 +211,61 @@ app.post('/api/translate-video', async (req, res) => {
 
     const timestamp = Date.now();
     const videoFileName = `${timestamp}_video.mp4`;
-    const videoPath = path.join(downloadsDir, videoFileName);
-    const audioPath = path.join(downloadsDir, `${timestamp}_audio.mp3`);
+    const audioFileName = `${timestamp}_audio.mp3`;
+    
+    // Utiliser le dossier temporaire pour les fichiers
+    const videoPath = path.join(tempDir, videoFileName);
+    const audioPath = path.join(tempDir, audioFileName);
     
     console.log(`[${requestId}] Chemins des fichiers:`, {
       videoPath,
       audioPath,
-      downloadsDir,
-      dirExists: fs.existsSync(downloadsDir)
+      tempDir,
+      dirExists: fs.existsSync(tempDir)
     });
     
-    // Créer le répertoire de téléchargement s'il n'existe pas
-    if (!fs.existsSync(downloadsDir)) {
-      console.log(`[${requestId}] Création du répertoire de téléchargement:`, downloadsDir);
-      fs.mkdirSync(downloadsDir, { recursive: true });
+    // S'assurer que le dossier temporaire existe
+    if (!fs.existsSync(tempDir)) {
+      console.log(`[${requestId}] Création du répertoire temporaire:`, tempDir);
+      fs.mkdirSync(tempDir, { recursive: true });
     }
 
     try {
       console.log(`[${requestId}] Début du téléchargement de la vidéo...`);
-      // 1. Télécharger la vidéo avec des options optimisées
+      // 1. Télécharger la vidéo avec yt-dlp
       let videoDownloaded = false;
       let downloadError = null;
       
       console.log(`[${requestId}] Téléchargement de la vidéo depuis:`, videoUrl);
       
-      // Première tentative avec des options optimisées
       try {
-        await youtubedl(videoUrl, {
-          output: videoPath,
-          format: 'mp4',
-          limitRate: '2M', // Limite le débit pour éviter les problèmes de connexion
-          retries: 3,      // Nombre de tentatives en cas d'échec
-          noCheckCertificate: true,
-          preferFreeFormats: true,
-          noWarnings: true
-        });
+        // Télécharger d'abord la meilleure qualité disponible
+        await ytdl.exec([
+          videoUrl,
+          '--format', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+          '--output', videoPath,
+          '--no-check-certificate',
+          '--retries', '3',
+          '--fragment-retries', '3',
+          '--buffer-size', '16K',
+          '--no-cache-dir',
+          '--no-part',
+          '--no-mtime',
+          '--force-overwrites',
+          '--no-playlist'
+        ]);
         
-        if (fs.existsSync(videoPath) && fs.statSync(videoPath).size > 0) {
-          videoDownloaded = true;
-          console.log('Téléchargement vidéo réussi avec la méthode principale');
-        }
       } catch (error) {
-        console.log('Première tentative de téléchargement échouée:', error.message);
+        console.error('Erreur lors du téléchargement:', error);
+        downloadError = error;
       }
       
-      // Méthode alternative si la première a échoué
-      if (!videoDownloaded) {
-        try {
-          console.log('Tentative avec méthode alternative...');
-          await youtubedl(videoUrl, {
-            output: videoPath,
-            format: 'best[ext=mp4]/best',
-            noCheckCertificate: true,
-            noWarnings: true,
-            addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0']
-          });
-          
-          if (fs.existsSync(videoPath) && fs.statSync(videoPath).size > 0) {
-            videoDownloaded = true;
-            console.log('Téléchargement vidéo réussi avec la méthode alternative');
-          }
-        } catch (error) {
-          console.log('Méthode alternative échouée:', error.message);
-          downloadError = error;
+      // Vérifier si le fichier a été téléchargé
+      if (fs.existsSync(videoPath)) {
+        const stats = fs.statSync(videoPath);
+        if (stats.size > 0) {
+          videoDownloaded = true;
+          console.log(`[${requestId}] Téléchargement réussi: ${stats.size} octets`);
         }
       }
       
@@ -287,57 +298,77 @@ app.post('/api/translate-video', async (req, res) => {
       
       console.log(`[${requestId}] Vérification du fichier vidéo réussie`);
 
-      console.log('Début de l\'extraction audio...');
-      // 2. Extraire l'audio avec des options optimisées
+      console.log(`[${requestId}] Début de l'extraction audio...`);
       let audioExtracted = false;
       
       try {
-        await youtubedl(videoUrl, {
-          extractAudio: true,
-          audioFormat: 'mp3',
-          output: audioPath,
-          retries: 3,
-          noCheckCertificate: true,
-          noWarnings: true
-        });
+        // Vérifier d'abord si la vidéo existe
+        if (!fs.existsSync(videoPath)) {
+          throw new Error('Le fichier vidéo est introuvable');
+        }
         
-        if (fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0) {
-          audioExtracted = true;
-          console.log('Extraction audio réussie avec la méthode principale');
+        // Obtenir les informations sur la vidéo
+        const videoStats = fs.statSync(videoPath);
+        if (videoStats.size === 0) {
+          throw new Error('Le fichier vidéo est vide');
         }
-      } catch (error) {
-        console.log('Première tentative d\'extraction audio échouée:', error.message);
-      }
-      
-      // Si l'extraction directe a échoué, essayer d'extraire l'audio à partir de la vidéo téléchargée
-      if (!audioExtracted && videoDownloaded) {
-        try {
-          console.log('Tentative d\'extraction audio à partir de la vidéo téléchargée...');
-          const { execSync } = require('child_process');
+        
+        console.log(`[${requestId}] Taille de la vidéo: ${(videoStats.size / (1024 * 1024)).toFixed(2)} Mo`);
+        
+        // Extraire l'audio avec FFmpeg
+        await new Promise((resolve, reject) => {
+          console.log(`[${requestId}] Démarrage de l'extraction audio avec FFmpeg...`);
           
-          // Obtenir la durée de la vidéo
-          console.log('Récupération de la durée de la vidéo...');
-          const durationOutput = execSync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`).toString().trim();
-          const videoDuration = parseFloat(durationOutput);
-          console.log(`Durée de la vidéo: ${videoDuration} secondes`);
-          
-          if (isNaN(videoDuration)) {
-            throw new Error('Impossible de déterminer la durée de la vidéo');
-          }
-          
-          // Créer un fichier audio silencieux de la même durée que la vidéo
-          console.log('Création d\'un fichier audio silencieux...');
-          execSync(`ffmpeg -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -t ${videoDuration} -c:a libmp3lame -b:a 128k "${audioPath}"`);
-          
-          if (fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0) {
-            audioExtracted = true;
-            console.log('Création d\'un fichier audio silencieux réussie');
-          } else {
-            throw new Error('Le fichier audio silencieux n\'a pas été créé correctement');
-          }
-        } catch (error) {
-          console.log('Extraction/création audio avec FFmpeg échouée:', error.message);
+          const command = ffmpeg(videoPath)
+            .noVideo()
+            .audioCodec('libmp3lame')
+            .audioBitrate(128)
+            .outputOptions([
+              '-ar 44100',
+              '-ac 2',
+              '-q:a 2',
+              '-y' // Écraser le fichier de sortie s'il existe
+            ])
+            .output(audioPath)
+            .on('start', (commandLine) => {
+              console.log(`[${requestId}] Commande FFmpeg: ${commandLine}`);
+            })
+            .on('progress', (progress) => {
+              if (progress.percent) {
+                console.log(`[${requestId}] Progression: ${Math.round(progress.percent)}%`);
+              }
+            })
+            .on('end', () => {
+              console.log(`[${requestId}] Extraction audio terminée avec succès`);
+              resolve();
+            })
+            .on('error', (err, stdout, stderr) => {
+              console.error(`[${requestId}] Erreur FFmpeg:`, err);
+              console.error(`[${requestId}] Sortie standard:`, stdout);
+              console.error(`[${requestId}] Sortie d'erreur:`, stderr);
+              reject(new Error(`Échec de l'extraction audio: ${err.message}`));
+            });
+            
+          command.run();
+        });
+
+        // Vérifier que le fichier audio a été créé
+        if (!fs.existsSync(audioPath)) {
+          throw new Error('Le fichier audio de sortie est introuvable');
         }
+        
+        const audioStats = fs.statSync(audioPath);
+        if (audioStats.size === 0) {
+          fs.unlinkSync(audioPath); // Supprimer le fichier vide
+          throw new Error('Le fichier audio généré est vide');
+        }
+        
+        audioExtracted = true;
+        console.log(`[${requestId}] Fichier audio créé avec succès: ${(audioStats.size / (1024 * 1024)).toFixed(2)} Mo`);
+        
+      } catch (audioError) {
+        console.error(`[${requestId}] Erreur lors de l'extraction audio:`, audioError);
+        throw new Error(`Impossible d'extraire l'audio: ${audioError.message}`);
       }
       
       if (!audioExtracted) {
@@ -369,13 +400,13 @@ app.post('/api/translate-video', async (req, res) => {
       console.log(`Nombre de segments traduits et synchronisés: ${synchronizedResult.segments.length}`);
 
       // Obtenir le chemin relatif pour l'URL
-      const relativeAudioPath = path.relative(path.join(__dirname, 'downloads'), translatedAudioPath);
-      const audioUrl = `/downloads/${relativeAudioPath.replace(/\\/g, '/')}`;      
+      const relativeAudioPath = path.relative(tempDir, translatedAudioPath);
+      const audioUrl = `/downloads/${relativeAudioPath.replace(/\\/g, '/')}`;
       console.log('URL audio finale:', audioUrl);
       
       // Obtenir le chemin relatif pour la vidéo
-      const relativeVideoPath = path.relative(path.join(__dirname, 'downloads'), videoPath);
-      const videoFileUrl = `/downloads/${relativeVideoPath.replace(/\\/g, '/')}`;      
+      const relativeVideoPath = path.relative(tempDir, videoPath);
+      const videoFileUrl = `/downloads/${relativeVideoPath.replace(/\\/g, '/')}`;
       console.log('URL vidéo originale:', videoFileUrl);
 
       // 5. Envoyer les chemins des fichiers
@@ -528,12 +559,55 @@ app.post('/api/merge-audio-video', async (req, res) => {
     console.error('Erreur détaillée lors de la fusion audio-vidéo:', error);
     res.status(500).json({ 
       error: "Une erreur est survenue lors de la fusion audio-vidéo. Veuillez réessayer.",
-      details: error.message,
-      stack: error.stack
+      details: error.message
     });
   }
 });
 
+// Fonction pour nettoyer les fichiers temporaires plus vieux que 1 heure
+function cleanupOldFiles() {
+  try {
+    const now = Date.now();
+    const oneHourAgo = now - (60 * 60 * 1000); // 1 heure en millisecondes
+    
+    if (!fs.existsSync(tempDir)) return;
+    
+    const files = fs.readdirSync(tempDir);
+    let deletedCount = 0;
+    
+    files.forEach(file => {
+      const filePath = path.join(tempDir, file);
+      const stats = fs.statSync(filePath);
+      
+      // Supprimer les fichiers de plus d'une heure
+      if (stats.mtimeMs < oneHourAgo) {
+        try {
+          if (stats.isDirectory()) {
+            fs.rmdirSync(filePath, { recursive: true });
+          } else {
+            fs.unlinkSync(filePath);
+          }
+          deletedCount++;
+        } catch (err) {
+          console.error(`Erreur lors de la suppression de ${filePath}:`, err);
+        }
+      }
+    });
+    
+    if (deletedCount > 0) {
+      console.log(`[NETTOYAGE] ${deletedCount} fichiers temporaires supprimés`);
+    }
+  } catch (err) {
+    console.error('Erreur lors du nettoyage des fichiers temporaires:', err);
+  }
+}
+
+// Planifier le nettoyage toutes les heures
+setInterval(cleanupOldFiles, 60 * 60 * 1000);
+// Premier nettoyage au démarrage
+setTimeout(cleanupOldFiles, 10000); // 10 secondes après le démarrage
+
+// Fonction utilitaire pour extraire l'ID d'une vidéo YouTube
 function extractVideoId(url) {
   const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
   const match = url.match(regExp);
